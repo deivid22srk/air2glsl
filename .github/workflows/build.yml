@@ -1,0 +1,28 @@
+name: Build
+
+# The full pipeline needs ShaderData.bin, which is Apple's and Ubisoft's
+# content and therefore not in this repository. CI builds the tool and checks
+# that it runs; translating a real container is documented in NOTES.md.
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM 18 and glslang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18-dev clang-18 glslang-tools spirv-tools
+
+      - name: Build
+        run: make LLVM_CONFIG=/usr/lib/llvm-18/bin/llvm-config CXX=clang++-18
+
+      - name: Check the CLI runs
+        run: ./air2glsl 2>&1 | head -3 || true

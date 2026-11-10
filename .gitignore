@@ -1,0 +1,5 @@
+air2glsl
+*.o
+*.spv
+out/
+*.log
