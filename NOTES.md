@@ -28,7 +28,7 @@ rasterisation.
 
 ```
 examined: 5924
-ok:       5796   (97.8%)
+ok:       5818   (98.2%)
   fragment 2198
   kernel   3191
   vertex    407
@@ -38,17 +38,14 @@ Failure reasons, all reported per shader by the tool:
 
 | count | reason |
 | --- | --- |
-| 90 | atomic read-modify-write on a texture buffer (`air.atomic_fetch_add_explicit_texture_buffer_1d`) |
-| 11 | `air.get_depth_texture_3d` |
-| 7 | `air.write_texture_3d.u.v4i32` |
-| 6 | `llvm.fshl` (funnel shift) |
-| 5 | assorted (`fast_tanh`, `simd_shuffle`, float buffer atomics, ...) |
-| ~9 | remaining local-address cases and one `cmpxchg` |
+| 90 | atomic read-modify-write on a texture buffer (`air.atomic_fetch_add_explicit_texture_buffer_1d`) — needs an `r32ui` remap decision that belongs with the driver |
+| 9 | assorted (float buffer atomics, `cmpxchg`, two unsupported constants) |
+| 7 | everything else |
 
 ## Compilation
 
 ```
-compiled:  5796
+compiled:  5818
 failed:       0
 ```
 

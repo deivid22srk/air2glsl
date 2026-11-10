@@ -295,6 +295,7 @@ class Emitter {
     /// addresses in `g_globals.io`.
     unsigned io_slots_ = 0;
     bool uses_subgroups_ = false;
+    bool uses_subgroup_shuffle_ = false;
     std::vector<const GlobalVariable *> globals_;
     std::map<const GlobalVariable *, std::string> global_names_;
     std::vector<Type *> ref_order_;
@@ -1005,6 +1006,18 @@ class Emitter {
                 }
                 return out + ")";
             }
+            if (starts_with(name, "llvm.fshl") && n >= 3) {
+                // A funnel shift is a rotate across two values; GLSL has no
+                // built-in, and the width comes from the type.
+                const unsigned bits =
+                    call.getType()->getPrimitiveSizeInBits();
+                const std::string mask = std::to_string(bits - 1);
+                const std::string shift =
+                    "(" + arg(2) + " & " + mask + ")";
+                return "(" + arg(0) + " << " + shift + " | " + arg(1) +
+                       " >> ((" + std::to_string(bits) + " - " + shift +
+                       ") & " + mask + "))";
+            }
             unsupported_.insert(name);
             return fail("unsupported llvm intrinsic: " + name);
         }
@@ -1062,10 +1075,6 @@ class Emitter {
         if (starts_with(name, "air.get_width_texture_2d_array")) {
             return "textureSize(g_tex_2darray[nonuniformEXT(int(" + arg(0) +
                    " & 0xffffu))], 0).x";
-        }
-        if (starts_with(name, "air.get_height_texture_3d")) {
-            return "textureSize(g_images3d[nonuniformEXT(int(" + arg(0) +
-                   " & 0xffffu))], 0).y";
         }
         if (starts_with(name, "air.fence_texture_")) {
             // A resource fence in Metal orders writes to a texture before the
@@ -1191,6 +1200,24 @@ class Emitter {
             return aggregate + "(imageLoad(" + array + "[nonuniformEXT(int(" +
                    arg(0) + " & 0xffffu))], ivec3(" + arg(1) + ", " + arg(2) +
                    "), " + arg(3) + "), 0)";
+        }
+        if (starts_with(name, "air.get_depth_texture_3d")) {
+            return "textureSize(g_tex_3d[nonuniformEXT(int(" + arg(0) +
+                   " & 0xffffu))], 0).z";
+        }
+        if (name == "air.write_texture_3d.u.v4i32" && n >= 3) {
+            helpers_.insert("write3d_int");
+            return "air_write_3d_int(" + arg(0) + ", ivec3(" + arg(1) + "), " +
+                   arg(2) + ")";
+        }
+        if (starts_with(name, "air.fast_tanh")) {
+            return "tanh(" + arg(0) + ")";
+        }
+        if (starts_with(name, "air.simd_shuffle")) {
+            // Subgroup shuffles need GL_KHR_shader_subgroup_shuffle; the index
+            // arrives as a 16-bit value.
+            uses_subgroup_shuffle_ = true;
+            return "subgroupShuffle(" + arg(0) + ", uint(" + arg(1) + "))";
         }
         if (starts_with(name, "air.get_width_texture_3d")) {
             return "textureSize(g_tex_3d[nonuniformEXT(int(" + arg(0) +
@@ -1671,6 +1698,13 @@ vec4 air_read_2d_ms_array(uint64_t tex, ivec3 coord, int sample_index) {
 }
 )";
         }
+        if (helpers_.count("write3d_int")) {
+            out << R"(
+void air_write_3d_int(uint64_t tex, ivec3 coord, ivec4 value) {
+    imageStore(g_images3d_int[nonuniformEXT(int(tex & 0xffffu))], coord, value);
+}
+)";
+        }
         if (helpers_.count("write3d")) {
             out << R"(
 void air_write_3d(uint64_t tex, ivec3 coord, vec4 value) {
@@ -2049,6 +2083,9 @@ bool Emitter::run(std::string &source, std::string &error) {
     out << "#extension GL_EXT_texture_buffer : require\n";
     if (uses_subgroups_) {
         out << "#extension GL_KHR_shader_subgroup_basic : require\n";
+    }
+    if (uses_subgroup_shuffle_) {
+        out << "#extension GL_KHR_shader_subgroup_shuffle : require\n";
     }
     out << "#extension GL_EXT_samplerless_texture_functions : require\n";
     out << "layout(set = 0, binding = 0) uniform texture2DArray "
