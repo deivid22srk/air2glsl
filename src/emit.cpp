@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cctype>
 #include <cstring>
 #include <map>
 #include <set>
@@ -64,6 +65,157 @@ std::string find_entry(const Module &module, Function *&entry) {
 /// std::string::starts_with is C++20; this keeps the code C++17.
 inline bool starts_with(const std::string &text, const char *prefix) {
     return text.compare(0, std::strlen(prefix), prefix) == 0;
+}
+
+/// One stage input or output, as described by Air's entry-point metadata.
+///
+/// The metadata is a tree of MDNodes whose leaf strings carry the semantics,
+/// for example:
+///
+///   !16 = !{!"air.vertex_output", !"user(texcoord0)", !"air.arg_type_name",
+///           !"float2", !"air.arg_name", !"texcoord0"}
+///   !21 = !{i32 0, !"air.vertex_id", !"air.arg_type_name", !"uint",
+///           !"air.arg_name", !"sv_vertexid0"}
+///
+/// Inputs carry the function argument index they correspond to, outputs are in
+/// return-struct field order.
+struct IoBinding {
+    unsigned index = 0;      // argument index (inputs) or field index (outputs)
+    std::string kind;        // "position", "fragment_input", "vertex_id", ...
+    std::string modifier;    // "user(texcoord0)", "air.invariant", ...
+    std::string type;        // "float4", "half2", "uint", ...
+    std::string name;        // "sv_position0", "texcoord0", ...
+    int location = -1;       // air.location_index, or N from user(N)
+    bool unused = false;     // air.arg_unused
+    /// True when the node carries an explicit argument index (fragment and
+    /// vertex entry points do; kernels list their inputs positionally).
+    bool has_index = false;
+};
+
+/// Reads the strings out of an MDNode into `out`.
+void collect_metadata_strings(const MDNode *node, std::vector<std::string> &out) {
+    for (const MDOperand &operand : node->operands()) {
+        if (auto *string = dyn_cast<MDString>(operand.get())) {
+            out.push_back(string->getString().str());
+        } else if (auto *nested = dyn_cast<MDNode>(operand.get())) {
+            collect_metadata_strings(nested, out);
+        }
+    }
+}
+
+/// Parses the inputs or outputs list of an Air entry-point node.
+std::vector<IoBinding> parse_io_bindings(const MDNode *list) {
+    std::vector<IoBinding> bindings;
+    if (list == nullptr) return bindings;
+    for (const MDOperand &operand : list->operands()) {
+        auto *entry = dyn_cast<MDNode>(operand.get());
+        if (entry == nullptr) continue;
+        IoBinding binding;
+        std::vector<std::string> strings;
+        collect_metadata_strings(entry, strings);
+        bool saw_index = false;
+        for (const std::string &text : strings) {
+            if (text == "air.arg_type_name" || text == "air.arg_name" ||
+                text == "air.arg_unused" || text == "air.location_index") {
+                continue;
+            }
+            if (text.rfind("user(", 0) == 0 || text.rfind("air.", 0) == 0 ||
+                text.rfind("sv_", 0) == 0) {
+                if (binding.kind.empty() &&
+                    (text.rfind("air.", 0) == 0 || text.rfind("sv_", 0) == 0)) {
+                    if (text.rfind("air.arg_", 0) != 0) binding.kind = text;
+                    continue;
+                }
+                if (text.rfind("user(", 0) == 0 && binding.modifier.empty()) {
+                    binding.modifier = text;
+                    // Metal names its bindings "user(texcoord2)": the number
+                    // is the trailing digits, not the leading ones.
+                    std::string inner = text.substr(5);
+                    if (const size_t close = inner.find(')');
+                        close != std::string::npos) {
+                        inner.resize(close);
+                    }
+                    size_t digits = inner.size();
+                    while (digits > 0 && std::isdigit(static_cast<unsigned char>(
+                                                     inner[digits - 1]))) {
+                        --digits;
+                    }
+                    if (digits < inner.size()) {
+                        binding.location =
+                            std::atoi(inner.c_str() + digits);
+                    }
+                    continue;
+                }
+                if (binding.name.empty() && text.rfind("sv_", 0) == 0) {
+                    binding.name = text;
+                    continue;
+                }
+                if (binding.name.empty() && binding.modifier.empty()) {
+                    binding.modifier = text;
+                }
+                continue;
+            }
+            if (text == "float" || text == "float2" || text == "float3" ||
+                text == "float4" || text == "half" || text == "half2" ||
+                text == "half3" || text == "half4" || text == "int" ||
+                text == "int2" || text == "int3" || text == "int4" ||
+                text == "uint" || text == "uint2" || text == "uint3" ||
+                text == "uint4" || text == "short" || text == "ushort" ||
+                text == "bool") {
+                binding.type = text;
+                continue;
+            }
+            if (!saw_index && binding.type.empty()) {
+                // Argument-buffer names look like "struct.top_level_global_ab.0";
+                // a plain name is kept as the binding's name.
+                if (text.rfind("struct.", 0) == 0) {
+                    binding.modifier = text;
+                    continue;
+                }
+                if (binding.name.empty()) binding.name = text;
+            }
+        }
+        // The index field is the first i32 in the node.
+        for (const MDOperand &operand : entry->operands()) {
+            if (auto *constant = mdconst::dyn_extract<ConstantInt>(operand.get())) {
+                binding.index = static_cast<unsigned>(constant->getZExtValue());
+                saw_index = true;
+                binding.has_index = true;
+                break;
+            }
+        }
+        for (const std::string &text : strings) {
+            if (text == "air.arg_unused") binding.unused = true;
+        }
+        // A render target's location is the first integer in the node; other
+        // bindings use air.location_index (first number of the pair) or the
+        // number in user(texcoordN).
+        if (binding.kind == "air.render_target") {
+            for (const MDOperand &operand : entry->operands()) {
+                if (auto *constant =
+                        mdconst::dyn_extract<ConstantInt>(operand.get())) {
+                    binding.location =
+                        static_cast<int>(constant->getZExtValue());
+                    break;
+                }
+            }
+        }
+        // air.location_index appears as "air.location_index", i32, i32: the
+        // second number is the location. Take the first integer pair after it.
+        for (size_t i = 0; i + 1 < entry->getNumOperands(); ++i) {
+            auto *string = dyn_cast<MDString>(entry->getOperand(i));
+            if (string == nullptr || string->getString() != "air.location_index") {
+                continue;
+            }
+            if (auto *constant = mdconst::dyn_extract<ConstantInt>(
+                    entry->getOperand(i + 1))) {
+                binding.location = static_cast<int>(constant->getZExtValue());
+            }
+            break;
+        }
+        bindings.push_back(binding);
+    }
+    return bindings;
 }
 
 class Emitter {
@@ -129,6 +281,20 @@ class Emitter {
     std::map<Type *, std::string> struct_names_;
     /// Metal globals (`device`/`constant` variables) become base addresses the
     /// host has to supply, declared as uint64_t uniforms.
+    /// Stage inputs by argument index, and outputs in return-struct order,
+    /// parsed from Air's entry-point metadata.
+    /// Stage inputs in argument order. Air lists them in the same order as the
+    /// entry's arguments (verified across all three stages), which is more
+    /// reliable than the index field those nodes also carry.
+    std::vector<IoBinding> inputs_;
+    std::map<unsigned, IoBinding> inputs_by_index_;
+    std::vector<IoBinding> positional_inputs_;
+    size_t positional_cursor_ = 0;
+    std::vector<IoBinding> outputs_;
+    /// Number of argument-buffer style inputs, which become host-supplied
+    /// addresses in `g_globals.io`.
+    unsigned io_slots_ = 0;
+    bool uses_subgroups_ = false;
     std::vector<const GlobalVariable *> globals_;
     std::map<const GlobalVariable *, std::string> global_names_;
     std::vector<Type *> ref_order_;
@@ -1584,6 +1750,141 @@ ivec4 air_gather_2d_array_u(uint64_t tex, uint64_t smp, vec2 coord,
         return "float(" + value + ")";
     }
 
+    /// Read-only lookup used by the pre-pass that counts io slots, so that
+    /// pass does not disturb the positional cursor.
+    const IoBinding *lookup_binding(unsigned index) const {
+        const auto it = inputs_by_index_.find(index);
+        if (it != inputs_by_index_.end()) return &it->second;
+        if (index < positional_inputs_.size()) return &positional_inputs_[index];
+        if (index < inputs_.size()) return &inputs_[index];
+        return nullptr;
+    }
+
+    /// The name inside a `user(...)` modifier ("texcoord0"), or "".
+    std::string varying_name(const IoBinding &binding) {
+        if (binding.modifier.rfind("user(", 0) != 0) return "";
+        const std::string inner = binding.modifier.substr(5);
+        const size_t close = inner.find(')');
+        return close == std::string::npos ? inner : inner.substr(0, close);
+    }
+
+    /// Varyings are numbered by order of first appearance, keyed by their full
+    /// name. The number in `user(texcoord2)` is not usable as a location: the
+    /// same number appears in different namespaces (a fragment shader here has
+    /// both `user(instanceid0)` and `user(texcoord0)`), and Metal's real
+    /// locations come from the pipeline, not from the name.
+    int varying_location(const IoBinding &binding) {
+        const std::string name = varying_name(binding);
+        if (name.empty()) return -1;
+        // `instanceid0` is not a varying: Metal exposes the provoking instance
+        // id as a stage input and there is no GLSL built-in for it.
+        if (name.find("instanceid") != std::string::npos) return -1;
+        const auto it = varying_locations_.find(name);
+        if (it != varying_locations_.end()) return it->second;
+        const int location = next_varying_location_++;
+        varying_locations_[name] = location;
+        return location;
+    }
+
+    std::map<std::string, int> varying_locations_;
+    int next_varying_location_ = 0;
+
+    /// The binding for argument `index`: an explicit index wins when the
+    /// metadata provides one, and inputs without an index are matched in the
+    /// order they appear.
+    const IoBinding *binding_for(unsigned index) {
+        const auto it = inputs_by_index_.find(index);
+        if (it != inputs_by_index_.end()) return &it->second;
+        if (positional_cursor_ < positional_inputs_.size()) {
+            return &positional_inputs_[positional_cursor_++];
+        }
+        // Kernels list their inputs without indices, and some of their nodes
+        // still carry a number that is not an argument index. Falling back to
+        // the raw order covers both.
+        if (index < inputs_.size()) return &inputs_[index];
+        return nullptr;
+    }
+
+    /// GLSL requires integer varyings to be flat-qualified, because they
+    /// cannot be interpolated.
+    bool needs_flat(const std::string &type) {
+        return type.rfind("int", 0) == 0 || type.rfind("uint", 0) == 0 ||
+               type.rfind("ivec", 0) == 0 || type.rfind("uvec", 0) == 0 ||
+               type.rfind("short", 0) == 0 || type.rfind("ushort", 0) == 0 ||
+               type == "bool" || type.rfind("bvec", 0) == 0;
+    }
+
+    /// An expression for a GLSL built-in, shaped to match the argument the
+    /// entry point expects: Metal passes the same value as a vector (a 3D
+    /// thread position, for example) or as a scalar.
+    std::string builtin(Type *argument, const char *name) {
+        const std::string type = glsl_type_of(argument);
+        if (argument->isVectorTy() && !type.empty()) {
+            return type + "(" + name + ")";
+        }
+        if (argument->isIntegerTy()) {
+            return "int(" + std::string(name) + ".x)";
+        }
+        return std::string(name) + ".x";
+    }
+
+    /// GLSL type for a name from Air's `air.arg_type_name` metadata.
+    std::string metadata_glsl_type(const std::string &name) {
+        static const std::map<std::string, std::string> kTypes = {
+            {"float", "float"},   {"float2", "vec2"},   {"float3", "vec3"},
+            {"float4", "vec4"},   {"half", "float"},    {"half2", "vec2"},
+            {"half3", "vec3"},    {"half4", "vec4"},    {"int", "int"},
+            {"int2", "ivec2"},    {"int3", "ivec3"},    {"int4", "ivec4"},
+            {"uint", "uint"},     {"uint2", "uvec2"},   {"uint3", "uvec3"},
+            {"uint4", "uvec4"},   {"short", "int"},     {"ushort", "uint"},
+            {"bool", "bool"},
+        };
+        const auto it = kTypes.find(name);
+        return it == kTypes.end() ? std::string() : it->second;
+    }
+
+    /// Converts `value` (of LLVM type `source`) to `target_type`, a GLSL type
+    /// name from the metadata. Returns `value` unchanged when either side is
+    /// unknown, so the emitter never invents a cast it cannot justify.
+    std::string conversion(Type *source, const std::string &target_type,
+                           const std::string &value) {
+        if (target_type.empty()) return value;
+        const std::string source_type = glsl_type_of(source);
+        if (source_type == target_type) return value;
+        const bool target_float = target_type[0] != 'i' && target_type[0] != 'u';
+        if (source->isVectorTy() && target_type.size() == 4 &&
+            target_type.rfind("vec", 0) == 0) {
+            const unsigned count =
+                cast<VectorType>(source)->getElementCount().getFixedValue();
+            if (count == 3) return "vec4(" + value + ", 1.0)";
+            if (count == 2) return "vec4(" + value + ", 0.0, 1.0)";
+            return "vec4(" + value + ")";
+        }
+        if (source->isVectorTy() && target_type.size() == 3) {
+            return value + ".xyz";
+        }
+        if (source->isVectorTy() && target_type.size() == 2) {
+            return value + ".xy";
+        }
+        if (!target_float && source->isFloatingPointTy()) {
+            return target_type + "(" + value + ")";
+        }
+        if (!target_float && source->isVectorTy()) {
+            return target_type + "(" + value + ")";
+        }
+        return target_type + "(" + value + ")";
+    }
+
+    /// GLSL type name for an LLVM type, without registering anything.
+    std::string glsl_type_of(Type *type) {
+        if (type->isPointerTy()) return "uint64_t";
+        if (auto *vector = dyn_cast<VectorType>(type)) {
+            return vector_name(vector->getElementType(),
+                               vector->getElementCount().getFixedValue());
+        }
+        return scalar_name(type);
+    }
+
     /// Appends " = <value>" when a default exists, so declarations of types
     /// without constructors (arrays) stay legal.
     std::string initializer(Type *t) {
@@ -1596,6 +1897,51 @@ ivec4 air_gather_2d_array_u(uint64_t tex, uint64_t smp, vec2 coord,
 };
 
 bool Emitter::run(std::string &source, std::string &error) {
+    // Parse the stage metadata up front: the globals block needs to know how
+    // many argument-buffer addresses the host must supply.
+    {
+        const char *metadata_name = stage_ == "vertex"     ? "air.vertex"
+                                    : stage_ == "fragment" ? "air.fragment"
+                                                           : "air.kernel";
+        if (const NamedMDNode *named = module_.getNamedMetadata(metadata_name)) {
+            if (named->getNumOperands() > 0) {
+                const MDNode *node = named->getOperand(0);
+                if (node->getNumOperands() >= 2) {
+                    outputs_ = parse_io_bindings(
+                        dyn_cast<MDNode>(node->getOperand(1).get()));
+                }
+                if (node->getNumOperands() >= 3) {
+                    inputs_ = parse_io_bindings(
+                        dyn_cast<MDNode>(node->getOperand(2).get()));
+                    for (const IoBinding &binding : inputs_) {
+                        if (binding.has_index) {
+                            inputs_by_index_[binding.index] = binding;
+                        } else {
+                            positional_inputs_.push_back(binding);
+                        }
+                    }
+                }
+            }
+        }
+        for (unsigned i = 0; i < entry_->arg_size(); ++i) {
+            Type *type = entry_->getFunctionType()->getParamType(i);
+            const IoBinding *binding = lookup_binding(i);
+            const std::string kind = binding == nullptr ? "" : binding->kind;
+            const bool buffer_like =
+                type->isPointerTy() || kind.empty() ||
+                kind == "air.indirect_buffer" || kind == "air.buffer" ||
+                kind == "air.threadgroup";
+            const bool builtin =
+                kind == "air.vertex_id" || kind == "air.instance_id" ||
+                kind == "air.position" || kind == "air.fragment_input" ||
+                kind.rfind("air.thread", 0) == 0 ||
+                kind.rfind("air.simdgroup", 0) == 0 ||
+                kind == "air.threads_per_threadgroup" ||
+                kind == "air.threadgroups_per_grid";
+            if (buffer_like && !builtin) ++io_slots_;
+        }
+    }
+
     // Entry arguments are the shader's inputs (Metal passes pointer arguments
     // as GPU addresses, so they are uint64_t here).
     for (unsigned i = 0; i < entry_->arg_size(); ++i) {
@@ -1701,6 +2047,9 @@ bool Emitter::run(std::string &source, std::string &error) {
     // Separate texture and sampler arrays: the translation combines them
     // explicitly, because Metal passes them as independent arguments.
     out << "#extension GL_EXT_texture_buffer : require\n";
+    if (uses_subgroups_) {
+        out << "#extension GL_KHR_shader_subgroup_basic : require\n";
+    }
     out << "#extension GL_EXT_samplerless_texture_functions : require\n";
     out << "layout(set = 0, binding = 0) uniform texture2DArray "
            "g_tex_2darray[256];\n";
@@ -1744,9 +2093,11 @@ bool Emitter::run(std::string &source, std::string &error) {
     out << "// The host writes every Metal global's GPU address, and the base\n";
     out << "// of a scratch buffer of at least AIR_SCRATCH_BYTES here.\n";
     out << "#define AIR_SCRATCH_BYTES " << scratch_size_ << "\n";
+    const size_t io_count = std::max<size_t>(1, io_slots_);
     out << "layout(set = 1, binding = 0) uniform Globals {\n";
     out << "    uint64_t scratch;\n";
     out << "    uint64_t ga[" << global_count << "];\n";
+    out << "    uint64_t io[" << io_count << "];\n";
     out << "} g_globals;\n\n";
 
     // Structs are collected while emitting, so this loop must tolerate
@@ -1801,67 +2152,168 @@ bool Emitter::run(std::string &source, std::string &error) {
     }
     out << "}\n\n";
 
-    // v0 entry point: inputs are stubbed, outputs are written to locations.
+    // ---- real stage entry point ---------------------------------------
+    //
+    // The ABI is taken from Air's own metadata: every input and output names
+    // its semantics (air.position, air.fragment_input, user(texcoord2), ...),
+    // so the generated main() reads the matching GLSL built-in or varying and
+    // passes the result through, instead of stubbing anything.
+    // Declarations for the varyings this shader exchanges with its neighbours.
+    // Inputs are numbered first (fragment shaders), outputs next (vertex).
+    for (const IoBinding &binding : inputs_) {
+        if (binding.kind != "air.fragment_input") continue;
+        varying_location(binding);
+    }
+    for (const IoBinding &binding : outputs_) {
+        if (binding.kind != "air.vertex_output") continue;
+        varying_location(binding);
+    }
+    // Output locations are resolved once: an explicit or name-derived location
+    // is used when it is free, otherwise the next free one. Two fields can
+    // legitimately name the same render target, and GLSL needs one declaration.
+    std::vector<int> output_locations(outputs_.size(), -1);
+    {
+        std::set<int> used;
+        for (size_t i = 0; i < outputs_.size(); ++i) {
+            int location = -1;
+            if (outputs_[i].kind == "air.vertex_output") {
+                location = varying_location(outputs_[i]);
+            } else if (outputs_[i].location >= 0) {
+                location = outputs_[i].location;
+            }
+            if (location < 0 || used.count(location)) {
+                location = 0;
+                while (used.count(location)) ++location;
+            }
+            used.insert(location);
+            output_locations[i] = location;
+        }
+    }
+
+    std::string io_declarations;
+    std::set<int> declared_inputs;
+    for (const IoBinding &binding : inputs_) {
+        if (binding.kind != "air.fragment_input") continue;
+        const int location = varying_locations_.count(varying_name(binding))
+                                 ? varying_locations_[varying_name(binding)]
+                                 : -1;
+        if (location < 0 || !declared_inputs.insert(location).second) continue;
+        const std::string type = metadata_glsl_type(binding.type);
+        if (type.empty()) continue;
+        io_declarations += "layout(location = " + std::to_string(location) +
+                           ") " + (needs_flat(type) ? "flat " : "") + "in " +
+                           type + " _in" + std::to_string(location) + ";\n";
+    }
+    std::set<int> declared_outputs;
+    for (size_t i = 0; i < outputs_.size(); ++i) {
+        const IoBinding &binding = outputs_[i];
+        if (binding.kind == "air.position" && stage_ == "vertex") continue;
+        const int location = output_locations[i];
+        if (location < 0 || !declared_outputs.insert(location).second) continue;
+        const std::string type = metadata_glsl_type(binding.type);
+        if (type.empty()) continue;
+        io_declarations += "layout(location = " + std::to_string(location) +
+                           ") " + (needs_flat(type) ? "flat " : "") + "out " +
+                           type + " _out" + std::to_string(location) + ";\n";
+    }
+
+    // Argument expressions, in the entry's own argument order.
     std::string arguments;
+    unsigned io_slot = 0;
     for (unsigned i = 0; i < entry_->arg_size(); ++i) {
         if (i) arguments += ", ";
-        const std::string value =
-            default_value(entry_->getFunctionType()->getParamType(i));
-        arguments += value.empty() ? "0" : value;
+        Type *type = entry_->getFunctionType()->getParamType(i);
+        const IoBinding *binding = binding_for(i);
+        const std::string kind = binding == nullptr ? "" : binding->kind;
+        const int location = binding == nullptr ? -1 : binding->location;
+        std::string value;
+        if (kind == "air.vertex_id") {
+            value = builtin(type, "gl_VertexIndex");
+        } else if (kind == "air.instance_id") {
+            value = builtin(type, "gl_InstanceIndex");
+        } else if (kind == "air.position" && stage_ == "fragment") {
+            value = "gl_FragCoord";
+        } else if (kind == "air.fragment_input" && binding != nullptr &&
+                   varying_location(*binding) >= 0) {
+            value = "_in" + std::to_string(varying_location(*binding));
+        } else if (kind == "air.thread_position_in_threadgroup") {
+            value = builtin(type, "gl_LocalInvocationID");
+        } else if (kind == "air.thread_index_in_threadgroup") {
+            value = "int(gl_LocalInvocationIndex)";
+        } else if (kind == "air.thread_index_in_simdgroup") {
+            uses_subgroups_ = true;
+            value = "int(gl_SubgroupInvocationID)";
+        } else if (kind == "air.simdgroup_index_in_threadgroup") {
+            uses_subgroups_ = true;
+            value = "int(gl_SubgroupID)";
+        } else if (kind == "air.threads_per_simdgroup") {
+            uses_subgroups_ = true;
+            value = "int(gl_SubgroupSize)";
+        } else if (kind == "air.threadgroup_position_in_grid") {
+            value = builtin(type, "gl_WorkGroupID");
+        } else if (kind == "air.thread_position_in_grid") {
+            value = builtin(type, "gl_GlobalInvocationID");
+        } else if (kind == "air.threads_per_threadgroup") {
+            value = builtin(type, "gl_WorkGroupSize");
+        } else if (kind == "air.threadgroups_per_grid") {
+            value = builtin(type, "gl_NumWorkGroups");
+        } else if (type->isPointerTy() || kind.empty() ||
+                   kind == "air.indirect_buffer" || kind == "air.buffer" ||
+                   kind == "air.threadgroup") {
+            // Argument buffers, buffer arguments and threadgroup memory are
+            // addresses the host supplies for each dispatch.
+            value = "g_globals.io[" + std::to_string(io_slot++) + "]";
+        } else {
+            const std::string fallback = default_value(type);
+            value = fallback.empty() ? "0" : fallback;
+            io_declarations += "// unsupported input binding: " + kind + "\n";
+        }
+        // The function signature is authoritative for the call: the metadata
+        // type only says what the value means. The expressions above are
+        // already written in the argument's own type, except for varyings,
+        // whose declared type comes from the metadata.
+        const std::string argument_type = glsl_type_of(type);
+        if (kind == "air.fragment_input" && binding != nullptr &&
+            !argument_type.empty() &&
+            argument_type != metadata_glsl_type(binding->type)) {
+            value = argument_type + "(" + value + ")";
+        }
+        arguments += value;
     }
+
+    auto *result_struct = dyn_cast<StructType>(entry_->getReturnType());
+    const size_t output_count =
+        result_struct != nullptr ? result_struct->getNumElements() : 0;
     if (stage_ == "kernel") {
-        out << "layout(local_size_x = 64) in;\n";
-        out << "void main() {\n";
-        if (entry_->getReturnType()->isVoidTy()) {
-            out << "    air_entry(" << arguments << ");\n";
-        } else {
-            out << "    " << result_type << " _r = air_entry(" << arguments
-                << ");\n";
-            out << "    (void)_r;\n";
-        }
-        out << "}\n";
-    } else {
-        auto *st = dyn_cast<StructType>(entry_->getReturnType());
-        const unsigned outputs = st ? st->getNumElements() : 1;
-        for (unsigned i = 0; i < outputs; ++i) {
-            const Type *type = st ? st->getElementType(i) : entry_->getReturnType();
-            const bool integer = type->getScalarType()->isIntegerTy() &&
-                                 !type->getScalarType()->isIntegerTy(1);
-            const std::string ty =
-                type->isVectorTy() ? (integer ? "ivec4" : "vec4")
-                                   : (integer ? "int" : "float");
-            if (stage_ == "vertex") {
-                out << "layout(location = " << i << ") out " << ty << " _v"
-                    << i << ";\n";
-            } else {
-                out << "layout(location = " << i << ") out " << ty << " _o"
-                    << i << ";\n";
-            }
-        }
-        out << "\nvoid main() {\n";
-        out << "    // v0: entry inputs are stubbed; wiring up gl_FragCoord,\n";
-        out << "    // vertex attributes and varyings is the next step.\n";
-        if (st) {
-            out << "    " << result_type << " _r = air_entry(" << arguments
-                << ");\n";
-            for (unsigned i = 0; i < outputs; ++i) {
-                const Type *type = st->getElementType(i);
-                const std::string field = "_r." + field_name(st, i);
-                Type *field_type = const_cast<Type *>(type);
-                if (stage_ == "vertex" && i == 0) {
-                    out << "    gl_Position = " << widen(field, field_type)
-                        << ";\n";
-                } else {
-                    out << "    _"
-                        << (stage_ == "vertex" ? "v" : "o") << i << " = "
-                        << widen(field, field_type) << ";\n";
-                }
-            }
-        } else {
-            out << "    air_entry(" << arguments << ");\n";
-        }
-        out << "}\n";
+        out << "#define AIR_LOCAL_SIZE_X 64\n";
+        out << "layout(local_size_x = AIR_LOCAL_SIZE_X) in;\n";
     }
+    out << io_declarations;
+    out << "\nvoid main() {\n";
+    if (result_struct != nullptr) {
+        out << "    " << result_type << " _r = air_entry(" << arguments
+            << ");\n";
+        for (size_t i = 0; i < output_count; ++i) {
+            Type *field_type = result_struct->getElementType(i);
+            const std::string field = "_r." + field_name(result_struct, i);
+            const bool is_position =
+                i < outputs_.size() && outputs_[i].kind == "air.position";
+            const int output_location =
+                i < output_locations.size() ? output_locations[i]
+                                            : static_cast<int>(i);
+            const std::string target =
+                (stage_ == "vertex" && is_position)
+                    ? std::string("gl_Position")
+                    : "_out" + std::to_string(output_location);
+            const std::string target_type =
+                i < outputs_.size() ? metadata_glsl_type(outputs_[i].type) : "";
+            out << "    " << target << " = "
+                << conversion(field_type, target_type, field) << ";\n";
+        }
+    } else {
+        out << "    air_entry(" << arguments << ");\n";
+    }
+    out << "}\n";
 
     source = out.str();
     if (!unsupported_.empty()) {
@@ -1875,6 +2327,63 @@ bool Emitter::run(std::string &source, std::string &error) {
 
 std::string find_stage(const Module &module, Function *&entry) {
     return find_entry(module, entry);
+}
+
+std::vector<std::string> describe_entry_io(const Module &module) {
+    std::vector<std::string> lines;
+    Function *entry = nullptr;
+    const std::string stage = find_stage(module, entry);
+    if (entry == nullptr) return lines;
+    lines.push_back("stage: " + stage);
+    std::string signature = "arguments:";
+    for (const Argument &argument : entry->args()) {
+        std::string text;
+        raw_string_ostream stream(text);
+        argument.getType()->print(stream);
+        signature += " " + stream.str();
+    }
+    lines.push_back(signature);
+
+    const char *metadata_name = stage == "vertex"      ? "air.vertex"
+                                : stage == "fragment"  ? "air.fragment"
+                                                       : "air.kernel";
+    const NamedMDNode *named = module.getNamedMetadata(metadata_name);
+    if (named == nullptr || named->getNumOperands() == 0) return lines;
+    const MDNode *node = named->getOperand(0);
+    lines.push_back("metadata operands: " +
+                    std::to_string(node->getNumOperands()));
+
+    auto format = [](const char *label, const IoBinding &binding,
+                     unsigned index) {
+        std::string line = "  " + std::string(label) + "[" +
+                           std::to_string(index) + "] kind=" +
+                           (binding.kind.empty() ? "(none)" : binding.kind) +
+                           " type=" +
+                           (binding.type.empty() ? "(none)" : binding.type) +
+                           " name=" +
+                           (binding.name.empty() ? "(none)" : binding.name);
+        if (!binding.modifier.empty()) line += " mod=" + binding.modifier;
+        if (binding.location >= 0) {
+            line += " location=" + std::to_string(binding.location);
+        }
+        if (binding.unused) line += " unused";
+        return line;
+    };
+
+    if (node->getNumOperands() >= 2) {
+        const auto outputs =
+            parse_io_bindings(dyn_cast<MDNode>(node->getOperand(1).get()));
+        for (size_t i = 0; i < outputs.size(); ++i) {
+            lines.push_back(format("output", outputs[i], (unsigned)i));
+        }
+    }
+    if (node->getNumOperands() >= 3) {
+        for (const IoBinding &binding :
+             parse_io_bindings(dyn_cast<MDNode>(node->getOperand(2).get()))) {
+            lines.push_back(format("input", binding, binding.index));
+        }
+    }
+    return lines;
 }
 
 Translation translate(const Module &module) {

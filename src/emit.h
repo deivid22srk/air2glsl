@@ -53,6 +53,11 @@ struct Translation {
 /// internal helper functions are inlined first.
 Translation translate(const llvm::Module &module);
 
+/// Describes the stage inputs and outputs of `module`'s Air entry point, one
+/// binding per line. Used by the `meta` subcommand to make the metadata that
+/// drives stage I/O visible.
+std::vector<std::string> describe_entry_io(const llvm::Module &module);
+
 /// Detects the Air stage ("vertex", "fragment", "kernel") of `module` from the
 /// `!air.*` named metadata, and sets `entry` to the entry function. Returns an
 /// empty string when the module has no Air entry point.

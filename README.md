@@ -68,9 +68,9 @@ for (int _guard = 0; _guard < 65536; ++_guard) {
   measure the parts that are actually hard (types, GEP, argument buffers,
   intrinsics).
 - **Phi nodes become variables** assigned on the edge that jumps to their block.
-- **Stage inputs are stubbed** in v0: the generated `main()` calls the
-  translated body with zeroes. The point of v0 is to prove the *body* translates
-  and compiles; wiring `gl_FragCoord`, attributes and varyings is the next step.
+- **Stage inputs and outputs are generated from Air's metadata**, not stubbed:
+  `gl_FragCoord`, `gl_Position`, `gl_VertexIndex`, the workgroup built-ins,
+  varyings at their locations, and argument buffers as host-supplied addresses.
 - **Resource handles carry a descriptor index in their low 16 bits**, which is
   the contract `air_sample_2d_array` documents. A real driver resolves the
   handle through the resource descriptor heap instead.

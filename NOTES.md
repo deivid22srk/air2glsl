@@ -76,12 +76,21 @@ against real content:
 
 ## What v0 does not do (and the order to fix it)
 
-1. **Stage I/O is stubbed** (next up). The generated `main()` calls the translated body
-   with zeroes. Air's `!air.vertex` / `!air.fragment` metadata already describes
-   every input and output (`air.position`, `air.fragment_input`,
-   `air.render_target`, `air.arg_name` → `sv_position0`, `texcoord0`, ...), so
-   this is mechanical: emit `gl_Position`/`gl_FragCoord`/varyings with the
-   locations the metadata gives, then drop the stub arguments.
+1. ~~Stage I/O is stubbed~~ — **done**. `main()` is generated from Air's own
+   metadata: `air.position` becomes `gl_FragCoord` (fragment) or the first
+   return field becomes `gl_Position` (vertex), `air.vertex_id` /
+   `air.instance_id` become `gl_VertexIndex` / `gl_InstanceIndex`, workgroup
+   builtins (`thread_position_in_threadgroup`, `threadgroup_position_in_grid`,
+   ...) become the matching `gl_*` built-ins, varyings become
+   `layout(location = N) in/out`, and argument buffers become host-supplied
+   addresses in `g_globals.io[]`. Integer varyings get `flat`, as GLSL requires.
+   `air2glsl meta <ShaderData.bin> --section N` prints the parsed bindings.
+
+   Two details found by testing against real content: the number inside
+   `user(texcoord2)` is *not* a location (one fragment shader here has both
+   `user(instanceid0)` and `user(texcoord0)`), so varyings are numbered by order
+   of first appearance keyed by their full name; and `instanceid` is not a
+   varying at all, so it is passed as a constant.
 2. **Resource handles are a promise, not a heap.** `air_sample_2d_array` assumes
    the low 16 bits of a Metal resource handle hold the descriptor index the host
    bound. A real driver has to build the descriptor heaps the app fills:

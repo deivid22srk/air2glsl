@@ -51,7 +51,8 @@ void usage() {
     std::fprintf(stderr,
                  "usage: air2glsl stats <ShaderData.bin>\n"
                  "       air2glsl dump  <ShaderData.bin> <out-dir> "
-                 "[--limit N]\n");
+                 "[--limit N]\n"
+                 "       air2glsl meta  <ShaderData.bin> [--limit N]\n");
 }
 
 int do_stats(const std::string &path) {
@@ -92,6 +93,37 @@ int do_stats(const std::string &path) {
     std::printf("instructions:         %zu\n", instructions);
     for (const auto &entry : stages) {
         std::printf("stage %-9s       %zu\n", entry.first.c_str(), entry.second);
+    }
+    return 0;
+}
+
+int do_meta(const std::string &path, size_t limit, long section) {
+    auto data = air2glsl::read_file(path);
+    const auto metallibs = air2glsl::find_metallibs(data);
+    const auto blobs = air2glsl::extract_bitcode(data, metallibs);
+    std::map<std::string, size_t> shown;
+    size_t examined = 0;
+    for (const auto &blob : blobs) {
+        if (examined >= limit) break;
+        if (section >= 0 && blob.metallib_index != static_cast<size_t>(section)) {
+            continue;
+        }
+        ++examined;
+        std::vector<uint8_t> bytes(data.begin() + blob.bitcode_offset,
+                                   data.begin() + blob.bitcode_offset + blob.size);
+        std::unique_ptr<Module> module = parse(bytes);
+        if (!module) continue;
+        Function *entry = nullptr;
+        const std::string stage = air2glsl::find_stage(*module, entry);
+        if (stage.empty()) continue;
+        if (shown[stage] >= 1) continue;
+        shown[stage]++;
+        std::printf("=== %s shader (payload %zu) ===\n", stage.c_str(),
+                    examined);
+        for (const std::string &line : air2glsl::describe_entry_io(*module)) {
+            std::printf("%s\n", line.c_str());
+        }
+        std::printf("\n");
     }
     return 0;
 }
@@ -161,6 +193,19 @@ int main(int argc, char **argv) {
     try {
         if (command == "stats") {
             return do_stats(argv[2]);
+        }
+        if (command == "meta") {
+            size_t limit = 400;
+            long section = -1;
+            for (int i = 3; i + 1 < argc; ++i) {
+                if (std::strcmp(argv[i], "--limit") == 0) {
+                    limit = std::strtoul(argv[i + 1], nullptr, 10);
+                }
+                if (std::strcmp(argv[i], "--section") == 0) {
+                    section = std::strtol(argv[i + 1], nullptr, 10);
+                }
+            }
+            return do_meta(argv[2], limit, section);
         }
         if (command == "dump") {
             if (argc < 4) {
