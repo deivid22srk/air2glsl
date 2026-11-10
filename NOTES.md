@@ -28,45 +28,55 @@ rasterisation.
 
 ```
 examined: 5924
-ok:       4891   (82.6%)
-  fragment 1818
-  kernel   2704
-  vertex    369
+ok:       5796   (97.8%)
+  fragment 2198
+  kernel   3191
+  vertex    407
 ```
 
 Failure reasons, all reported per shader by the tool:
 
 | count | reason |
 | --- | --- |
-| 280 | address of local memory escapes (a pointer to an alloca is passed on) |
-| 189 | `air.gather_compare_depth_2d_array.f32` |
-| 171 | `air.sample_compare_depth_2d_array.f32` |
-| 75 | `air.sample_texture_2d_array_grad.v4f32` |
-| 68 | atomic reads/writes on texture buffers |
-| 51 | `air.write_texture_buffer_1d.v4f32` |
-| 45 | `atomicrmw` |
-| 35 | `air.calculate_clamped_lod_texture_2d_array` |
-| 22 | `air.atomic.global.add.s.i32` |
-| 22 | assorted (`llvm.fshl`, `fast_tanh`, `simd_shuffle`, `cmpxchg`, ...) |
+| 90 | atomic read-modify-write on a texture buffer (`air.atomic_fetch_add_explicit_texture_buffer_1d`) |
+| 11 | `air.get_depth_texture_3d` |
+| 7 | `air.write_texture_3d.u.v4i32` |
+| 6 | `llvm.fshl` (funnel shift) |
+| 5 | assorted (`fast_tanh`, `simd_shuffle`, float buffer atomics, ...) |
+| ~9 | remaining local-address cases and one `cmpxchg` |
 
 ## Compilation
 
 ```
-compiled:  4889
-failed:     2
+compiled:  5796
+failed:       0
 ```
 
-So 4,889 of the 4,891 generated files are valid Vulkan GLSL according to
-`glslangValidator`. The two failures are stores through a `buffer_reference`
-whose member type was inferred from the stored value rather than the pointee
-(a known v0 shortcut).
+Every shader the translator accepts now produces valid Vulkan GLSL according to
+`glslangValidator --target-env vulkan1.3`. Getting there needed four real fixes
+that are worth recording, because they are the kind of thing that only shows up
+against real content:
 
-That 99.96 % figure is the useful one for planning: the *emitter* is not the
-hard part. What remains is everything the emitter deliberately stubs.
+1. **Type punning in locals.** The game stores floats through pointers to
+   `[4 x i32]` arrays. GLSL cannot reinterpret bytes in a local, so any alloca
+   whose address is used for a different type is moved into a host-allocated
+   scratch buffer (`AIR_SCRATCH_BYTES`) and addressed with `buffer_reference`,
+   which *can* address bytes.
+2. **`threadgroup` globals.** Air gives `addrspace(3)` globals an undef
+   initialiser and expects the driver to supply the address, which is exactly
+   what the global-address block now models.
+3. **Shadow sampling.** `textureGather` on a `sampler2DArrayShadow` takes the
+   coordinate and the reference value as separate arguments, not a packed
+   `vec4`, and a shadow sampler cannot be built from a separate texture and
+   sampler, so depth-compare paths use a combined shadow sampler binding.
+4. **`textureQueryLod`** cannot take a sampler constructed from a separate
+   texture and sampler at all (glslang rejects it), and for an array sampler it
+   takes only the coordinate, not the layer. The clamped-LOD intrinsic therefore
+   uses one combined-sampler binding and drops the layer from the query.
 
 ## What v0 does not do (and the order to fix it)
 
-1. **Stage I/O is stubbed.** The generated `main()` calls the translated body
+1. **Stage I/O is stubbed** (next up). The generated `main()` calls the translated body
    with zeroes. Air's `!air.vertex` / `!air.fragment` metadata already describes
    every input and output (`air.position`, `air.fragment_input`,
    `air.render_target`, `air.arg_name` → `sv_position0`, `texcoord0`, ...), so
@@ -80,16 +90,15 @@ hard part. What remains is everything the emitter deliberately stubs.
    `air.struct_type_info`, i.e. their layout is defined by the runtime, not the
    IR. This is the descriptor-buffer/descriptor-indexing problem, and it is the
    biggest remaining piece of the graphics work.
-3. **Atomics.** 45 `atomicrmw` plus 90 atomic resource operations. GLSL needs
-   SSBO/atomic-counter members or `imageAtomic*`; garbage-free translation needs
-   a scratch buffer model, not a cast.
+3. **Atomics on texture buffers.** Global atomics (`atomicrmw`,
+   `air.atomic.global.*`) now translate to GLSL atomics on `buffer_reference`
+   members, which glslang accepts. The 90 remaining ones operate on *texture
+   buffers* (a typed buffer view), which needs `imageAtomic*` through an
+   `iimageBuffer` and a read-modify-write model of the value type.
 4. **Compare/gather and gradient sampling.** 360 shaders use depth-compare
    sampling (`sampler2DShadow`, `textureGatherCompare`) and 75 use explicit
    gradients (`textureGrad`). Both are direct GLSL built-ins; they were simply
    not wired up in v0.
-5. **Local address escapes.** 280 shaders take the address of a local. The fix
-   is to place such locals in a scratch SSBO addressed with `buffer_reference`,
-   which the addressing model already supports.
 6. **Performance.** The `switch` dispatcher is correct but slow (each block is a
    case, every edge is a jump). Before this is usable in a game it needs
    structured output (`if`/`for`), which is a CFG-structuring pass over a

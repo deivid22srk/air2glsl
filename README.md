@@ -96,8 +96,8 @@ tools/validate.sh out/
 | --- | --- |
 | Container → bitcode | 5,924 / 5,924 payloads, 0 parse failures |
 | Shaders by stage | 3,309 compute, 2,208 fragment, 407 vertex |
-| Translate to Vulkan GLSL | 4,891 / 5,924 (82.6 %) |
-| Compile with `glslangValidator` | 4,889 / 4,891 (99.96 %) |
+| Translate to Vulkan GLSL | 5,796 / 5,924 (97.8 %) |
+| Compile with `glslangValidator` | 5,796 / 5,796 (100 %) |
 
 v0 proves the pipeline end to end and reports the failure distribution. It is
 not a usable driver component yet: stage I/O is stubbed, resource handles are a

@@ -89,6 +89,39 @@ class Emitter {
 
     std::map<const Value *, std::string> names_;
     std::map<const AllocaInst *, std::string> locals_;
+    /// Allocas whose address is taken. They cannot be GLSL locals, because
+    /// their address has to be a real value; they get a slice of a scratch
+    /// buffer instead, addressed with buffer_reference.
+    std::map<const AllocaInst *, uint64_t> scratch_;
+    uint64_t scratch_size_ = 0;
+
+    /// True when a value (an alloca, or a cast/GEP chain rooted at one) is used
+    /// for anything other than being loaded from or stored to.
+    bool address_escapes(const Value *value, std::set<const Value *> &seen) {
+        if (!seen.insert(value).second) return false;
+        for (const User *user : value->users()) {
+            if (isa<LoadInst>(user)) continue;
+            if (auto *store = dyn_cast<StoreInst>(user)) {
+                if (store->getValueOperand() == value) return true;
+                continue;
+            }
+            if (isa<GetElementPtrInst>(user)) {
+                if (address_escapes(user, seen)) return true;
+                continue;
+            }
+            if (isa<BitCastOperator>(user)) {
+                // A bitcast in an access chain means the same bytes are
+                // accessed as another type (packing floats into an integer
+                // array, for example). With opaque pointers the cast itself
+                // carries no type, so this is treated as addressing: GLSL
+                // cannot pun types in a local, but a buffer_reference
+                // addresses bytes, so the alloca goes to the scratch buffer.
+                return true;
+            }
+            return true;
+        }
+        return false;
+    }
     std::map<const BasicBlock *, int> block_ids_;
     std::vector<const BasicBlock *> blocks_;
 
@@ -276,11 +309,32 @@ class Emitter {
 
     /// GLSL expression for a non-pointer value.
     std::string expr(const Value *v) {
-        if (auto *c = dyn_cast<Constant>(v)) {
-            if (v->getType()->isPointerTy()) {
-                if (isa<ConstantPointerNull>(v)) return "0L";
-                return fail("unsupported constant pointer");
+        if (v->getType()->isPointerTy()) {
+            // Globals (including `threadgroup` globals, which Air gives a host
+            // supplied address) and constant GEP expressions resolve like any
+            // other pointer.
+            if (isa<ConstantPointerNull>(v)) return "0L";
+            if (isa<GlobalVariable>(v) || isa<GEPOperator>(v)) {
+                PtrRef ref = resolve(v);
+                if (!error_.empty()) return "";
+                if (ref.local) {
+                std::string text;
+                raw_string_ostream stream(text);
+                v->print(stream);
+                return fail("address of local memory escapes: " +
+                            stream.str().substr(0, 90));
             }
+                return address_of(ref);
+            }
+            if (auto *constant = dyn_cast<Constant>(v)) {
+                std::string text;
+                raw_string_ostream stream(text);
+                constant->print(stream);
+                fail("unsupported constant pointer: " + stream.str().substr(0, 80));
+                return "";
+            }
+        }
+        if (auto *c = dyn_cast<Constant>(v)) {
             return constant_expr(c);
         }
         // Pointer-typed SSA values are GPU addresses; resolve them so that
@@ -289,7 +343,13 @@ class Emitter {
         if (v->getType()->isPointerTy()) {
             PtrRef ref = resolve(v);
             if (!error_.empty()) return "";
-            if (ref.local) return fail("address of local memory escapes");
+            if (ref.local) {
+                std::string text;
+                raw_string_ostream stream(text);
+                v->print(stream);
+                return fail("address of local memory escapes: " +
+                            stream.str().substr(0, 90));
+            }
             return address_of(ref);
         }
         const auto it = names_.find(v);
@@ -327,6 +387,15 @@ class Emitter {
     PtrRef resolve(const Value *ptr) {
         PtrRef ref;
         if (auto *alloca = dyn_cast<AllocaInst>(ptr)) {
+            const auto scratch = scratch_.find(alloca);
+            if (scratch != scratch_.end()) {
+                ref.local = false;
+                ref.base = "g_globals.scratch";
+                if (scratch->second != 0) {
+                    ref.offset = std::to_string(scratch->second) + "L";
+                }
+                return ref;
+            }
             ref.local = true;
             ref.base = locals_[alloca];
             return ref;
@@ -641,6 +710,50 @@ class Emitter {
         return "(" + a + " " + op + " " + b + ")";
     }
 
+    /// Maps an Air global atomic onto a GLSL atomic on a buffer variable.
+    std::string atomic_call(const CallInst &call, const std::string &name) {
+        Type *element = call.getType();
+        if (!element->isIntegerTy()) {
+            return fail("atomic on a non-integer type: " + name);
+        }
+        std::string operation;
+        bool negate = false;
+        if (name.find(".add.") != std::string::npos) {
+            operation = "atomicAdd";
+        } else if (name.find(".sub.") != std::string::npos) {
+            operation = "atomicAdd";
+            negate = true;
+        } else if (name.find(".and.") != std::string::npos) {
+            operation = "atomicAnd";
+        } else if (name.find(".or.") != std::string::npos) {
+            operation = "atomicOr";
+        } else if (name.find(".xor.") != std::string::npos) {
+            operation = "atomicXor";
+        } else if (name.find(".min.") != std::string::npos) {
+            operation = "atomicMin";
+        } else if (name.find(".max.") != std::string::npos) {
+            operation = "atomicMax";
+        } else if (name.find(".xchg.") != std::string::npos) {
+            operation = "atomicExchange";
+        } else if (name.find(".cmpxchg.") != std::string::npos) {
+            // (ptr, ptr comparand, new value, ...): the comparand arrives as a
+            // pointer (often to a local), so it is loaded rather than
+            // addressed, which also keeps the local from escaping.
+            const std::string comparand = load_through(
+                resolve(call.getArgOperand(1)), element);
+            if (comparand.empty()) return "";
+            return "atomicCompSwap(" + ref_type(element) + "(" +
+                   expr(call.getArgOperand(0)) + ").v0, " + comparand + ", " +
+                   expr(call.getArgOperand(2)) + ")";
+        } else {
+            return fail("unsupported atomic: " + name);
+        }
+        const std::string value = expr(call.getArgOperand(1));
+        const std::string operand = negate ? "(-" + value + ")" : value;
+        return operation + "(" + ref_type(element) + "(" +
+               expr(call.getArgOperand(0)) + ").v0, " + operand + ")";
+    }
+
     std::string emit_intrinsic(const CallInst &call) {
         Function *callee = call.getCalledFunction();
         if (callee == nullptr) return fail("indirect call");
@@ -856,6 +969,81 @@ class Emitter {
             helpers_.insert("writebuffer");
             return "air_write_buffer(" + arg(0) + ", " + arg(1) + ", " +
                    arg(2) + ")";
+        }
+        // ---- depth-compare sampling ------------------------------------
+        // Shadow sampling needs a combined shadow sampler: GLSL cannot build
+        // one from a separate texture and sampler, so the app's sampler state
+        // is approximated by the bound shadow sampler.
+        if (name == "air.sample_compare_depth_2d_array.f32" && n >= 6) {
+            const std::string aggregate = type_name(call.getType());
+            if (aggregate.empty()) return "";
+            return aggregate + "(texture(g_shadow_2darray[nonuniformEXT(int(" +
+                   arg(0) + " & 0xffffu))], vec4(" + arg(3) + ", " + arg(4) +
+                   ", " + arg(5) + ")), 0)";
+        }
+        if (name == "air.gather_compare_depth_2d_array.f32" && n >= 6) {
+            const std::string aggregate = type_name(call.getType());
+            if (aggregate.empty()) return "";
+            // The shadow form of textureGather takes the coordinate (uv plus
+            // layer, as a vec3) and the reference value separately.
+            return aggregate + "(textureGather(g_shadow_2darray[nonuniformEXT(" +
+                   "int(" + arg(0) + " & 0xffffu))], vec3(" + arg(3) + ", " +
+                   "float(" + arg(4) + ")), " + arg(5) + "), 0)";
+        }
+
+        // ---- explicit gradients ----------------------------------------
+        if (name == "air.sample_texture_2d_array_grad.v4f32" && n >= 6) {
+            helpers_.insert("sample2darraygrad");
+            const std::string aggregate = type_name(call.getType());
+            if (aggregate.empty()) return "";
+            return aggregate + "(air_sample_2d_array_grad(" + arg(0) + ", " +
+                   arg(1) + ", " + arg(2) + ", " + arg(3) + ", " + arg(4) +
+                   ", " + arg(5) + "), 0)";
+        }
+        if (name == "air.calculate_clamped_lod_texture_2d_array" && n >= 4) {
+            // textureQueryLod's .y is the level of detail clamped to the
+            // texture's own limits, which is what this Air intrinsic returns.
+            // For an array sampler, textureQueryLod takes only the coordinate
+            // (vec2); the layer is not part of its argument.
+            return std::string("textureQueryLod("
+                               "g_tex_2darray_combined[nonuniformEXT(int(") +
+                   arg(0) + " & 0xffffu))], vec2(" + arg(2) + ")).y";
+        }
+
+        // ---- remaining texture shapes ----------------------------------
+        if (name == "air.write_texture_buffer_1d.v4f32" && n >= 3) {
+            helpers_.insert("writebufferf");
+            return "air_write_buffer_f(" + arg(0) + ", int(" + arg(1) + "), " +
+                   arg(2) + ")";
+        }
+        if (starts_with(name, "air.read_texture_2d_ms_array.") && n >= 4) {
+            const std::string aggregate = type_name(call.getType());
+            if (aggregate.empty()) return "";
+            const char *array = aggregate_is_integer(call.getType())
+                                    ? "g_images_ms_int"
+                                    : "g_images_ms";
+            return aggregate + "(imageLoad(" + array + "[nonuniformEXT(int(" +
+                   arg(0) + " & 0xffffu))], ivec3(" + arg(1) + ", " + arg(2) +
+                   "), " + arg(3) + "), 0)";
+        }
+        if (starts_with(name, "air.get_width_texture_3d")) {
+            return "textureSize(g_tex_3d[nonuniformEXT(int(" + arg(0) +
+                   " & 0xffffu))], 0).x";
+        }
+        if (starts_with(name, "air.get_height_texture_3d")) {
+            return "textureSize(g_tex_3d[nonuniformEXT(int(" + arg(0) +
+                   " & 0xffffu))], 0).y";
+        }
+        if (starts_with(name, "air.get_array_size_texture_2d_array")) {
+            return "textureSize(g_tex_2darray[nonuniformEXT(int(" + arg(0) +
+                   " & 0xffffu))], 0).z";
+        }
+
+        // ---- atomics on global memory ----------------------------------
+        // Air models a global atomic as (address, ...args); GLSL atomics work
+        // on a buffer variable, which a buffer_reference member is.
+        if (starts_with(name, "air.atomic.")) {
+            return atomic_call(call, name);
         }
         if (starts_with(name, "air.fast_clamp")) {
             return "clamp(" + arg(0) + ", " + arg(1) + ", " + arg(2) + ")";
@@ -1111,6 +1299,46 @@ class Emitter {
             line("    _pc = -1;");
             return true;
         }
+        if (auto *rmw = dyn_cast<AtomicRMWInst>(&instruction)) {
+            // The result of an atomicrmw is the value before the operation.
+            const char *operation = nullptr;
+            bool negate = false;
+            switch (rmw->getOperation()) {
+                case AtomicRMWInst::Add: operation = "atomicAdd"; break;
+                case AtomicRMWInst::Sub:
+                    operation = "atomicAdd";
+                    negate = true;
+                    break;
+                case AtomicRMWInst::And: operation = "atomicAnd"; break;
+                case AtomicRMWInst::Or: operation = "atomicOr"; break;
+                case AtomicRMWInst::Xor: operation = "atomicXor"; break;
+                case AtomicRMWInst::Min: operation = "atomicMin"; break;
+                case AtomicRMWInst::Max: operation = "atomicMax"; break;
+                case AtomicRMWInst::UMin: operation = "atomicMin"; break;
+                case AtomicRMWInst::UMax: operation = "atomicMax"; break;
+                case AtomicRMWInst::Xchg: operation = "atomicExchange"; break;
+                default: break;
+            }
+            if (operation == nullptr) {
+                fail("unsupported atomicrmw operation");
+                return false;
+            }
+            Type *element = rmw->getValOperand()->getType();
+            if (!element->isIntegerTy()) {
+                fail("float atomicrmw");
+                return false;
+            }
+            const std::string value = expr(rmw->getValOperand());
+            const std::string operand =
+                negate ? "(-" + value + ")" : value;
+            line(tmp + " = " + operation + "(" + ref_type(element) + "(" +
+                 expr(rmw->getPointerOperand()) + ").v0, " + operand + ");");
+            return true;
+        }
+        if (isa<AtomicCmpXchgInst>(&instruction)) {
+            fail("unsupported instruction: cmpxchg");
+            return false;
+        }
         if (auto *sw = dyn_cast<SwitchInst>(&instruction)) {
             line("switch (" + expr(sw->getCondition()) + ") {");
             for (const auto &handle : sw->cases()) {
@@ -1222,6 +1450,26 @@ void air_write_2d_array(uint64_t tex, ivec3 coord, vec4 value) {
 }
 )";
         }
+        if (helpers_.count("sample2darraygrad")) {
+            out << R"(
+vec4 air_sample_2d_array_grad(uint64_t tex, uint64_t smp, vec2 coord,
+                              int slice, vec2 ddx, vec2 ddy) {
+    int ti = int(tex & 0xffffu);
+    int si = int(smp & 0xffffu);
+    return textureGrad(sampler2DArray(g_tex_2darray[nonuniformEXT(ti)],
+                                      g_samplers[nonuniformEXT(si)]),
+                       vec3(coord, float(slice)), ddx, ddy);
+}
+)";
+        }
+        if (helpers_.count("writebufferf")) {
+            out << R"(
+void air_write_buffer_f(uint64_t tex, int index, vec4 value) {
+    imageStore(g_buffer_images_f[nonuniformEXT(int(tex & 0xffffu))], index,
+               value);
+}
+)";
+        }
         if (helpers_.count("samplecube")) {
             out << R"(
 vec4 air_sample_cube_array(uint64_t tex, uint64_t smp, vec3 coord,
@@ -1314,7 +1562,15 @@ ivec4 air_gather_2d_array_u(uint64_t tex, uint64_t smp, vec2 coord,
             const unsigned count =
                 cast<VectorType>(type)->getElementCount().getFixedValue();
             if (!type->getScalarType()->isFloatingPointTy()) {
-                return "int(" + value + ")";
+                // Keep integer vectors as vectors so the declared stage
+                // output type and this expression agree.
+                switch (count) {
+                    case 4: return value;
+                    case 3: return "ivec4(" + value + ", 1)";
+                    case 2: return "ivec4(" + value + ", 0, 0)";
+                    case 1: return "ivec4(" + value + ")";
+                    default: return "ivec4(0)";
+                }
             }
             switch (count) {
                 case 4: return value;
@@ -1367,13 +1623,26 @@ bool Emitter::run(std::string &source, std::string &error) {
         }
         for (const Instruction &instruction : block) {
             if (auto *alloca = dyn_cast<AllocaInst>(&instruction)) {
-                const std::string name = "_a" + std::to_string(locals_.size());
-                locals_[alloca] = name;
                 const std::string ty = type_name(alloca->getAllocatedType());
                 if (ty.empty()) {
                     error = error_.empty() ? "unsupported alloca type" : error_;
                     return false;
                 }
+                std::set<const Value *> seen;
+                if (address_escapes(alloca, seen)) {
+                    const uint64_t alignment =
+                        std::max<uint64_t>(1, layout_.getABITypeAlign(
+                                                  alloca->getAllocatedType())
+                                                  .value());
+                    scratch_size_ = (scratch_size_ + alignment - 1) / alignment *
+                                    alignment;
+                    scratch_[alloca] = scratch_size_;
+                    scratch_size_ += layout_.getTypeAllocSize(
+                        alloca->getAllocatedType());
+                    continue;
+                }
+                const std::string name = "_a" + std::to_string(locals_.size());
+                locals_[alloca] = name;
                 declarations << "    " << ty << " " << name << ";\n";
             }
         }
@@ -1447,6 +1716,16 @@ bool Emitter::run(std::string &source, std::string &error) {
            "g_ubuffer[64];\n";
     out << "layout(set = 0, binding = 11, rgba32i) uniform iimage3D "
            "g_images3d_int[32];\n";
+    out << "layout(set = 0, binding = 12) uniform sampler2DArrayShadow "
+           "g_shadow_2darray[64];\n";
+    out << "layout(set = 0, binding = 13, rgba32f) uniform imageBuffer "
+           "g_buffer_images_f[64];\n";
+    out << "layout(set = 0, binding = 14, rgba32i) uniform iimage2DMSArray "
+           "g_images_ms_int[32];\n";
+    // textureQueryLod cannot take a sampler built from a separate texture and
+    // sampler, so this one binding is a combined image sampler.
+    out << "layout(set = 0, binding = 15) uniform sampler2DArray "
+           "g_tex_2darray_combined[64];\n";
     out << "layout(set = 0, binding = 6, rgba32f) uniform image2DMSArray "
            "g_images_ms[32];\n";
     out << "layout(set = 0, binding = 7, rgba32i) uniform iimage2DArray "
@@ -1458,15 +1737,17 @@ bool Emitter::run(std::string &source, std::string &error) {
 
     // Metal globals become base addresses the host supplies. Vulkan forbids
     // non-opaque uniforms outside a block, so they live in one.
-    out << "// Metal globals: the host writes each variable's GPU address "
-           "here.\n";
-    if (!globals_.empty()) {
-        out << "struct GlobalAddresses {\n";
-        out << "    uint64_t ga[" << globals_.size() << "];\n";
-        out << "};\n";
-        out << "layout(set = 1, binding = 0) uniform Globals { uint64_t ga["
-            << globals_.size() << "]; } g_globals;\n\n";
-    }
+    // Metal globals become addresses the host supplies, and escapes of local
+    // memory are placed in a host-allocated scratch buffer. Vulkan forbids
+    // non-opaque uniforms outside a block, so they share one.
+    const size_t global_count = std::max<size_t>(1, globals_.size());
+    out << "// The host writes every Metal global's GPU address, and the base\n";
+    out << "// of a scratch buffer of at least AIR_SCRATCH_BYTES here.\n";
+    out << "#define AIR_SCRATCH_BYTES " << scratch_size_ << "\n";
+    out << "layout(set = 1, binding = 0) uniform Globals {\n";
+    out << "    uint64_t scratch;\n";
+    out << "    uint64_t ga[" << global_count << "];\n";
+    out << "} g_globals;\n\n";
 
     // Structs are collected while emitting, so this loop must tolerate
     // growth from the declarations it writes.
@@ -1544,9 +1825,11 @@ bool Emitter::run(std::string &source, std::string &error) {
         const unsigned outputs = st ? st->getNumElements() : 1;
         for (unsigned i = 0; i < outputs; ++i) {
             const Type *type = st ? st->getElementType(i) : entry_->getReturnType();
-            const std::string ty = type->isVectorTy()
-                                       ? "vec4"
-                                       : (type->isIntegerTy() ? "int" : "float");
+            const bool integer = type->getScalarType()->isIntegerTy() &&
+                                 !type->getScalarType()->isIntegerTy(1);
+            const std::string ty =
+                type->isVectorTy() ? (integer ? "ivec4" : "vec4")
+                                   : (integer ? "int" : "float");
             if (stage_ == "vertex") {
                 out << "layout(location = " << i << ") out " << ty << " _v"
                     << i << ";\n";
