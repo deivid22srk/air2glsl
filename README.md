@@ -19,6 +19,40 @@ Background: `docs/ASSASSINS_CREED_MIRAGE.md` in
 4. Emits Vulkan GLSL for the shader body.
 5. Reports per-shader failures with a reason, so progress is measurable.
 
+## What the translation looks like
+
+An Air argument buffer is a struct of pointers, and the shader follows them:
+
+```llvm
+%struct__desc = type { ptr addrspace(1), ptr addrspace(1), i64 }
+%..unpack14 = load ptr addrspace(1), ptr addrspace(2) %..elt13, align 8
+%21 = call { <4 x float>, i8 } @air.sample_texture_2d_array.v4f32(
+        ptr addrspace(1) %..unpack14, ptr addrspace(2) %.1.unpack, ...)
+```
+
+which becomes address arithmetic on a `uint64_t` handle, a cast to a
+`buffer_reference` type when memory is actually touched, and a documented
+helper for the resource:
+
+```glsl
+_t10 = Ref0((_arg4 + 48L)).v0;            // load a pointer from an arg buffer
+_t12 = s1(air_sample_2d_array(_t11, _t7, _arg1, 0, 0.0, 0.0), 0);
+```
+
+Control flow becomes a dispatcher, so that any CFG translates:
+
+```glsl
+int _pc = 0;
+for (int _guard = 0; _guard < 65536; ++_guard) {
+    switch (_pc) {
+        case 0: { _t4 = (_arg0 * 2.0); _pc = 3; break; }
+        case 3: { if (_t4 > 1.0) { _pc = 7; } else { _pc = 5; } break; }
+        ...
+    }
+    if (_pc < 0) break;
+}
+```
+
 ## Design choices
 
 - **Vulkan GLSL, not GLSL ES.** Metal passes raw GPU addresses around: argument
